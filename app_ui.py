@@ -51,6 +51,7 @@ st.markdown("""
     h1, h2, h3, h4, h5, h6, .markdown-text-container {
         font-family: 'Plus Jakarta Sans', 'Noto Sans TC', sans-serif !important;
         letter-spacing: 0.025em; /* tracking-wide */
+        color: #ffffff !important;
     }
 
     /* 2. 玻璃面板效果 (Glassmorphism) - .glass-shell */
@@ -185,21 +186,75 @@ st.markdown("""
     .delay-2 { animation-delay: 0.10s; opacity: 0; }
     .delay-3 { animation-delay: 0.15s; opacity: 0; }
 
-    /* 修飾 Streamlit 預設 Input 組件以融入暗色系 */
-    .stTextInput > div > div > input, .stNumberInput > div > div > input {
-        background-color: rgba(255,255,255,0.03) !important;
-        color: #f8fafc !important;
-        border: 1px solid rgba(255,255,255,0.1) !important;
-        border-radius: 8px !important;
-    }
-    .stTextInput > div > div > input:focus {
-        border-color: #8b5cf6 !important;
-        box-shadow: 0 0 0 1px #8b5cf6 !important;
+    /* ======================================================== */
+    /* 🎯 TDD: Task 1 - 拯救所有標籤文字 (Labels) 與說明字體顏色 */
+    /* ======================================================== */
+    .stTextInput label, .stNumberInput label, .stSlider label, .stCheckbox label, 
+    div[data-testid="stWidgetLabel"] p, label > div > p, .stMarkdown p {
+        color: #e2e8f0 !important;
     }
 
-    /* 修飾按鈕 (Neon Glow CTAs) */
-    [data-testid="baseButton-primary"] {
+    /* ======================================================== */
+    /* 🎯 TDD: Task 2 - 深色化 File Uploader (Dropzone) */
+    /* ======================================================== */
+    [data-testid="stFileUploader"] {
+        background-color: transparent !important;
+    }
+    [data-testid="stFileUploaderDropzone"] {
+        background-color: rgba(0, 0, 0, 0.2) !important;
+        border: 1px dashed rgba(255,255,255,0.3) !important;
+        border-radius: 12px !important;
+    }
+    [data-testid="stFileUploaderDropzone"] section, 
+    [data-testid="stFileUploaderDropzone"] div, 
+    [data-testid="stFileUploaderDropzone"] span {
+        color: #e2e8f0 !important;
+        /* 確保不會繼承父層的強制白色背景 */
+        background-color: transparent !important; 
+    }
+    /* File Uploader 內建按鈕 */
+    [data-testid="stFileUploaderDropzone"] button {
+        background-color: rgba(255,255,255,0.1) !important;
+        color: #ffffff !important;
+        border: 1px solid rgba(255,255,255,0.2) !important;
+        border-radius: 6px !important;
+    }
+    [data-testid="stFileUploaderDropzone"] button:hover {
+        background-color: rgba(255,255,255,0.15) !important;
+    }
+
+    /* ======================================================== */
+    /* 🎯 TDD: Task 3 - 修復輸入框與 Slider 的顏色與白屏現象 */
+    /* ======================================================== */
+    .stTextInput > div > div, .stNumberInput > div > div {
+        background-color: transparent !important;
+    }
+    .stTextInput > div > div > input, .stNumberInput > div > div > input {
+        background-color: #f1f5f9 !important; /* 配合黑字，將底色換成極亮灰 */
+        color: #0f172a !important; /* 左側欄的 輸入欄位， font color 改成黑色 */
+        border: 1px solid rgba(255,255,255,0.1) !important;
+        border-radius: 8px !important;
+        font-weight: 600 !important;
+    }
+    .stTextInput > div > div > input:focus, .stNumberInput > div > div > input:focus {
+        border-color: #8b5cf6 !important;
+        box-shadow: 0 0 0 1px #8b5cf6 !important;
+        background-color: rgba(0, 0, 0, 0.5) !important;
+    }
+    
+    /* 拯救 Slider 不可視的值 */
+    .stSlider [data-testid="stThumbValue"] {
+        color: #e2e8f0 !important;
+        font-weight: bold;
+    }
+
+    /* ======================================================== */
+    /* 🎯 TDD: Task 4 - 強勢重寫 Primary 按鈕 (阻擋原廠覆蓋) */
+    /* ======================================================== */
+    /* 使用屬性選擇器強壓 Streamlit 的 inline style */
+    div[data-testid="stButton"] button[kind="primary"] {
         background: linear-gradient(to right, #6366f1, #8b5cf6) !important;
+        background-color: transparent !important; /* 解除原生底色 */
         border: none !important;
         color: white !important;
         font-weight: 600 !important;
@@ -208,30 +263,41 @@ st.markdown("""
         box-shadow: 0 0 15px rgba(139, 92, 246, 0.4) !important;
         transition: all 0.3s ease !important;
     }
-    [data-testid="baseButton-primary"]:hover {
+    div[data-testid="stButton"] button[kind="primary"]:hover {
         box-shadow: 0 0 25px rgba(139, 92, 246, 0.6) !important;
-        transform: translateY(-1px) !important;
+        transform: translateY(-2px) !important;
     }
-    [data-testid="baseButton-secondary"] {
+    div[data-testid="stButton"] button[kind="secondary"] {
         background: rgba(255,255,255,0.05) !important;
         border: 1px solid rgba(255,255,255,0.1) !important;
         color: #f8fafc !important;
         border-radius: 8px !important;
         transition: all 0.3s ease !important;
     }
-    [data-testid="baseButton-secondary"]:hover {
-        background: rgba(255,255,255,0.08) !important;
+    div[data-testid="stButton"] button[kind="secondary"]:hover {
+        background: rgba(255,255,255,0.1) !important;
         border-color: rgba(255,255,255,0.2) !important;
     }
 
-    /* DataFrame 表格背景變暗 */
+    /* ======================================================== */
+    /* 其他補充：DataFrame 與 Status Container 的防禦性暗色設計 */
+    /* ======================================================== */
     [data-testid="stDataFrame"] {
         background: rgba(15, 23, 42, 0.4);
         border-radius: 8px;
         padding: 8px;
         border: 1px solid rgba(255,255,255,0.05);
     }
-
+    [data-testid="stStatusWidget"] {
+        background: rgba(15, 23, 42, 0.5) !important;
+        border: 1px solid rgba(255,255,255,0.1) !important;
+        color: #e2e8f0 !important;
+    }
+    /* Info 提示框防護 */
+    [data-testid="stAlert"] {
+        background-color: rgba(255,255,255,0.05) !important;
+        color: #e2e8f0 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -361,6 +427,11 @@ elif use_local:
     except FileNotFoundError:
         st.warning("⚠️ 查無本地快取資料。請上傳檔案或透過 CLI 生成。")
 
+if cad_data:
+    has_route = any(ent.get("type") == "AcDbPolyline" and "ROUTE" in str(ent.get("layer", "")).upper() for ent in cad_data)
+    if has_route:
+        st.info("💡 偵測到走道引導線 (ROUTE)，已準備就緒啟動「空間拓樸循序編排」演算法！")
+
 st.markdown('</div>', unsafe_allow_html=True)
 
 
@@ -439,9 +510,9 @@ if "results" in st.session_state and st.session_state["results"]:
         column_config={
             "倉位號碼": st.column_config.TextColumn("實體識別 (ID)", width="medium"),
             "屬性": st.column_config.TextColumn("倉型 (Type)", width="small"),
-            "W": st.column_config.NumberColumn("淨面寬 x", format="%.2f m"),
-            "D": st.column_config.NumberColumn("淨深 y", format="%.2f m"),
-            "H": st.column_config.NumberColumn("高度 z", format="%.1f m"),
+            "W": st.column_config.NumberColumn("寬 mm"),
+            "D": st.column_config.NumberColumn("深 mm"),
+            "H": st.column_config.NumberColumn("高 mm"),
         },
     )
 

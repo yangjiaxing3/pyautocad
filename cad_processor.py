@@ -27,6 +27,32 @@ def extract_lines_and_texts(entities):
 def _distance(p1, p2):
     return math.hypot(p1[0] - p2[0], p1[1] - p2[1])
 
+class SpatialHashGrid:
+    """O(1) 查表的空間雜湊分區系統"""
+    def __init__(self, cell_size: float):
+        self.cell_size = cell_size
+        self.cells = {}
+
+    def _get_key(self, x: float, y: float) -> tuple[int, int]:
+        return (int(x // self.cell_size), int(y // self.cell_size))
+
+    def insert(self, x: float, y: float, item: any):
+        key = self._get_key(x, y)
+        if key not in self.cells:
+            self.cells[key] = []
+        self.cells[key].append(item)
+
+    def query_radius(self, x: float, y: float, radius: float) -> set:
+        candidates = set()
+        min_key = self._get_key(x - radius, y - radius)
+        max_key = self._get_key(x + radius, y + radius)
+        
+        for cx in range(min_key[0], max_key[0] + 1):
+            for cy in range(min_key[1], max_key[1] + 1):
+                if (cx, cy) in self.cells:
+                    candidates.update(self.cells[(cx, cy)])
+        return candidates
+
 def group_lines_to_polygons(lines, threshold=5.0):
     """Line Stitching 演算法，找出連通區域並產出 Bounding Box"""
     n = len(lines)
@@ -44,15 +70,27 @@ def group_lines_to_polygons(lines, threshold=5.0):
         if root_i != root_j:
             parent[root_i] = root_j
             
-    # O(N^2) 判斷線段端點距離
+    # 使用空間分區加速 O(N^2) -> O(N)
+    grid = SpatialHashGrid(cell_size=threshold)
+    for i, line in enumerate(lines):
+        grid.insert(line['start'][0], line['start'][1], i)
+        grid.insert(line['end'][0], line['end'][1], i)
+
     for i in range(n):
-        for j in range(i + 1, n):
-            si = lines[i]['start']
-            ei = lines[i]['end']
+        si = lines[i]['start']
+        ei = lines[i]['end']
+        
+        # 尋找鄰居
+        candidates = set()
+        candidates.update(grid.query_radius(si[0], si[1], threshold))
+        candidates.update(grid.query_radius(ei[0], ei[1], threshold))
+        
+        for j in candidates:
+            if i >= j: continue  # 避免重複計算或自己算自己
+            
             sj = lines[j]['start']
             ej = lines[j]['end']
             
-            # 如果任一端點距離小於閾值
             if (_distance(si, sj) <= threshold or 
                 _distance(si, ej) <= threshold or
                 _distance(ei, sj) <= threshold or
@@ -71,15 +109,22 @@ def group_lines_to_polygons(lines, threshold=5.0):
     for comp in components.values():
         xs = []
         ys = []
+        colors = []
         for line in comp:
             xs.extend([line['start'][0], line['end'][0]])
             ys.extend([line['start'][1], line['end'][1]])
+            if "color" in line:
+                colors.append(line["color"])
+                
+        dominant_color = max(set(colors), key=colors.count) if colors else -1
+
         if xs and ys:
             polygons.append({
                 "min_x": min(xs),
                 "max_x": max(xs),
                 "min_y": min(ys),
-                "max_y": max(ys)
+                "max_y": max(ys),
+                "color": dominant_color
             })
     return polygons
 
@@ -213,8 +258,14 @@ def assign_sequence_by_route(spaces, route_polyline, start_num, exclude_list):
             "dist_along_route": accumulated_dist_along_route
         })
         
-    # 按軌跡長度排序
-    space_distances.sort(key=lambda item: item["dist_along_route"])
+    # 修正：加入次要排序鍵，確保面對面的對稱倉位能有穩定的先後順序
+    # 使用 round(, 1) 消除極微小的浮點公差
+    space_distances.sort(key=lambda item: (
+        round(item["dist_along_route"], 1),
+        round(item["space"]["min_y"], 1),
+        round(item["space"]["min_x"], 1)
+    ))
+
     
     current_num = start_num
     exclude_set = set(exclude_list)

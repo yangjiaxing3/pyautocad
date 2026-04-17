@@ -61,6 +61,11 @@ def get_cad_data():
                 except:
                     pass
 
+                try:
+                    ent_data['layer'] = entity.Layer
+                except:
+                    pass
+
                 if ent_type in ['AcDbText', 'AcDbMText']:
                     ent_data['text'] = entity.TextString
                     ent_data['x'] = entity.InsertionPoint[0]
@@ -69,6 +74,12 @@ def get_cad_data():
                 elif ent_type == 'AcDbLine':
                     ent_data['start'] = [entity.StartPoint[0], entity.StartPoint[1]]
                     ent_data['end'] = [entity.EndPoint[0], entity.EndPoint[1]]
+                elif ent_type == 'AcDbPolyline':
+                    coords = entity.Coordinates
+                    vertices = []
+                    for k in range(0, len(coords), 2):
+                        vertices.append([coords[k], coords[k+1]])
+                    ent_data['vertices'] = vertices
                 elif ent_type == 'AcDbBlockReference':
                     ent_data['name'] = entity.Name
                     ent_data['x'] = entity.InsertionPoint[0]

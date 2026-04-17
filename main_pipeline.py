@@ -25,29 +25,29 @@ from cad_processor import (
 
 logger = logging.getLogger(__name__)
 
-# NOTE: 顏色對照表 — 依據 CAD 圖層顏色判定倉位類型與高度
+# NOTE: 顏色對照表 — 依據 CAD 圖層顏色判定倉位類型與高度 (單位改為 mm)
 COLOR_MAPPING: dict[int, tuple[str, float]] = {
-    3: ("單", 2.3),    # Green
-    8: ("單", 2.0),    # Gray
-    251: ("單", 2.0),  # Gray
-    6: ("半", 2.8),    # Purple/Magenta
-    5: ("雙", 3.2),    # Dark blue
-    4: ("雙", 3.3),    # Cyan
-    2: ("雙", 3.4),    # Yellow
-    30: ("雙", 3.6),   # Orange
-    7: ("雙", 4.0),    # White
-    0: ("雙", 4.0),    # White/ByBlock
-    256: ("雙", 4.0),  # White/ByLayer
+    3: ("單", 2300),    # Green
+    8: ("單", 2000),    # Gray
+    251: ("單", 2000),  # Gray
+    6: ("半", 2800),    # Purple/Magenta
+    5: ("雙", 3200),    # Dark blue
+    4: ("雙", 3300),    # Cyan
+    2: ("雙", 3400),    # Yellow
+    30: ("雙", 3600),   # Orange
+    7: ("雙", 4000),    # White
+    0: ("雙", 4000),    # White/ByBlock
+    256: ("雙", 4000),  # White/ByLayer
 }
 
 
 def _format_unit_id(text: str, prefix: str = "") -> str:
-    """將數字部分補零為 3 位，並加上前綴"""
-    def pad_num(match: re.Match) -> str:
-        return match.group(1).zfill(3)
-
-    padded = re.sub(r"(\d+)", pad_num, text)
-    return f"{prefix}{padded}" if prefix else padded
+    """提取裡面唯一的數字，並補足3位附上乾淨的 Prefix，避免出現 HDHD 的錯誤"""
+    match = re.search(r"(\d+)", text)
+    if match:
+        num = match.group(1).zfill(3)
+        return f"{prefix}{num}" if prefix else num
+    return text
 
 
 def _categorize_texts(texts: list[dict]) -> tuple[list[dict], list[dict], list[dict]]:
@@ -66,13 +66,27 @@ def _categorize_texts(texts: list[dict]) -> tuple[list[dict], list[dict], list[d
         if not txt:
             continue
 
-        if re.match(r"^\d+(\.\d+)?$", txt):
-            dims.append(t)
-        elif "單" in txt or "雙" in txt or "半" in txt:
+        is_pure_number = re.match(r"^\d+(\.\d+)?$", txt)
+        has_prefix = re.match(r"^[A-Za-z]+.*?\d+", txt)
+
+        if "單" in txt or "雙" in txt or "半" in txt:
             attrs.append(t)
-        elif re.match(r"^[A-Za-z]+.*?\d+", txt) or re.match(r"^\d+$", txt):
-            if len(txt) <= 8:
+        elif has_prefix:
+            if len(txt) <= 12:
                 boxes.append(t)
+        elif is_pure_number:
+            num = float(txt)
+            c = t.get("color", -1)
+            # 如果顏色明確為 2 或 6，必定為尺寸
+            if c in (2, 6):
+                dims.append(t)
+            # 若不是特定色，但數值代表合理的尺寸 (>= 500mm)，也歸為尺寸
+            elif num >= 500:
+                dims.append(t)
+            # 其餘較小的純數字(例如 "1", "12", "104")，視為倉位編號
+            else:
+                if len(txt) <= 8:
+                    boxes.append(t)
 
     return boxes, dims, attrs
 
@@ -108,6 +122,13 @@ def run_pipeline(
 
     logger.info("Pipeline 啟動：%d 個 entities, prefix=%s", len(cad_data), prefix)
 
+    if not route_polyline:
+        for ent in cad_data:
+            if ent.get("type") == "AcDbPolyline" and "ROUTE" in str(ent.get("layer", "")).upper():
+                route_polyline = ent.get("vertices")
+                logger.info("Found auto-routing polyline path!")
+                break
+
     # 1. 過濾排除項目
     clean_data = filter_excluded_texts(cad_data, exclude_list)
 
@@ -127,63 +148,154 @@ def run_pipeline(
     pillars, spaces = identify_pillars(polygons, max_pillar_size=max_pillar_size)
     logger.info("柱子: %d, 可用空間: %d", len(pillars), len(spaces))
 
-    # 6. 使用文字座標+顏色進行精準比對（直接從文字座標匹配）
+    from cad_processor import SpatialHashGrid
+    # 預建空間雜湊網格 (Spatial Hash Grids) 降低 O(N²) 的效能死角
+    dim_grid = SpatialHashGrid(cell_size=dim_distance_threshold)
+    for i, d in enumerate(dims):
+        dim_grid.insert(d.get("x", 0), d.get("y", 0), i)
+
+    attr_grid = SpatialHashGrid(cell_size=800.0)
+    for i, a in enumerate(attrs):
+        attr_grid.insert(a.get("x", 0), a.get("y", 0), i)
+
     results = []
-    for b in boxes:
-        bx, by = b.get("x", 0), b.get("y", 0)
 
-        # 找最近的屬性標籤
-        closest_attr = None
-        min_dist = float("inf")
-        for a in attrs:
-            dist = math.hypot(a.get("x", 0) - bx, a.get("y", 0) - by)
-            if dist < min_dist:
-                min_dist = dist
-                closest_attr = a
+    if route_polyline and spaces:
+        # 軌跡動線模式 (Polyline Routing)
+        from cad_processor import assign_sequence_by_route
+        sequenced_spaces = assign_sequence_by_route(spaces, route_polyline, start_num, exclude_list)
+        
+        for s in sequenced_spaces:
+            bx = (s["min_x"] + s["max_x"]) / 2
+            by = (s["min_y"] + s["max_y"]) / 2
+            
+            # 取出分配好的號碼並補零冠前綴
+            raw_id = str(s["unit_id"])
+            unit_id = f"{prefix}{raw_id.zfill(3)}" if prefix else raw_id.zfill(3)
 
-        # 找最近的兩個尺寸
-        sorted_dims = sorted(
-            dims, key=lambda d: math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by)
-        )
-        nearest_dims = sorted_dims[:2]
+            # 從空間雜湊網格中尋找鄰近屬性標籤
+            closest_attr = None
+            min_dist = float("inf")
+            candidate_attr_indices = attr_grid.query_radius(bx, by, 800.0)
+            for idx in candidate_attr_indices:
+                a = attrs[idx]
+                dist = math.hypot(a.get("x", 0) - bx, a.get("y", 0) - by)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_attr = a
 
-        # 判定 W 和 D
-        w_val = None
-        d_val = None
-        for d in nearest_dims:
-            if math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by) > dim_distance_threshold:
-                continue
-            val = round(float(d["text"]) / 1000.0, 2)
-            if d.get("color") == 2:  # Yellow → Width
-                w_val = val
-            else:
-                d_val = val
+            # 找最近的兩個尺寸
+            candidate_dim_indices = dim_grid.query_radius(bx, by, dim_distance_threshold)
+            candidate_dims = [dims[idx] for idx in candidate_dim_indices]
+            sorted_dims = sorted(
+                candidate_dims, key=lambda d: math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by)
+            )
+            nearest_dims = sorted_dims[:2]
 
-        if w_val is None and len(nearest_dims) >= 1:
-            w_val = round(float(nearest_dims[0]["text"]) / 1000.0, 2)
-        if d_val is None and len(nearest_dims) >= 2:
-            d_val = round(float(nearest_dims[1]["text"]) / 1000.0, 2)
+            # 判定 W 和 D
+            w_val = None
+            d_val = None
+            for d in nearest_dims:
+                if math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by) > dim_distance_threshold:
+                    continue
+                val = round(float(d["text"])) # 取 mm 整數
+                if d.get("color") == 2:  # Yellow → Width
+                    w_val = val
+                else:
+                    d_val = val
 
-        # 判定 Type 與 H
-        attr_type = ""
-        h_val: float | str = ""
+            if w_val is None and len(nearest_dims) >= 1:
+                w_val = round(float(nearest_dims[0]["text"]))
+            if d_val is None and len(nearest_dims) >= 2:
+                d_val = round(float(nearest_dims[1]["text"]))
 
-        if closest_attr and min_dist < 500:
-            c = closest_attr.get("color", -1)
-            if c in COLOR_MAPPING:
-                attr_type, h_val = COLOR_MAPPING[c]
-            else:
-                attr_type, h_val = "單", 2.3
+            # 判定 Type 與 H
+            attr_type = ""
+            h_val = 0.0
 
-        if not attr_type:
-            c = b.get("color", -1)
-            if c in COLOR_MAPPING:
-                attr_type, h_val = COLOR_MAPPING[c]
+            if closest_attr and min_dist < 800: # 提高容錯
+                c = closest_attr.get("color", -1)
+                if c in COLOR_MAPPING:
+                    attr_type, h_val = COLOR_MAPPING[c]
+                else:
+                    attr_type, h_val = "單", 2300
 
-        if w_val is not None and d_val is not None:
+            if not attr_type:
+                c = s.get("color", -1) # 從空間多邊形提取
+                if c in COLOR_MAPPING:
+                    attr_type, h_val = COLOR_MAPPING[c]
+
             results.append({
-                "倉位號碼": _format_unit_id(b["text"], prefix),
-                "屬性": attr_type,
+                "倉位號碼": unit_id,
+                "屬性": attr_type or "單",
+                "W": w_val,
+                "D": d_val,
+                "H": h_val,
+            })
+
+    else:
+        # 傳統文字定錨模式 (Text Anchoring)
+        for b in boxes:
+            bx, by = b.get("x", 0), b.get("y", 0)
+    
+            # 找最近的屬性標籤
+            closest_attr = None
+            min_dist = float("inf")
+            candidate_attr_indices = attr_grid.query_radius(bx, by, 800.0)
+            for idx in candidate_attr_indices:
+                a = attrs[idx]
+                dist = math.hypot(a.get("x", 0) - bx, a.get("y", 0) - by)
+                if dist < min_dist:
+                    min_dist = dist
+                    closest_attr = a
+    
+            # 找最近的兩條尺寸標註
+            dims_with_dist = []
+            candidate_dim_indices = dim_grid.query_radius(bx, by, dim_distance_threshold)
+            for idx in candidate_dim_indices:
+                d = dims[idx]
+                dist = math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by)
+                dims_with_dist.append((dist, d))
+            
+            dims_with_dist.sort(key=lambda x: x[0])
+            nearest_dims = [d[1] for d in dims_with_dist[:2]]
+    
+            # 判定 W 和 D
+            w_val = None
+            d_val = None
+            for d in nearest_dims:
+                if math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by) > dim_distance_threshold:
+                    continue
+                val = round(float(d["text"])) # 取 mm 整數
+                if d.get("color") == 2:  # Yellow → Width
+                    w_val = val
+                else:
+                    d_val = val
+    
+            if w_val is None and len(nearest_dims) >= 1:
+                w_val = round(float(nearest_dims[0]["text"]))
+            if d_val is None and len(nearest_dims) >= 2:
+                d_val = round(float(nearest_dims[1]["text"]))
+    
+            # 判定 Type 與 H
+            attr_type = ""
+            h_val = 0.0
+    
+            if closest_attr and min_dist < 500:
+                c = closest_attr.get("color", -1)
+                if c in COLOR_MAPPING:
+                    attr_type, h_val = COLOR_MAPPING[c]
+                else:
+                    attr_type, h_val = "單", 2300
+    
+            if not attr_type:
+                c = b.get("color", -1)
+                if c in COLOR_MAPPING:
+                    attr_type, h_val = COLOR_MAPPING[c]
+    
+            results.append({
+                "倉位號碼": _format_unit_id(b.get("text", ""), prefix),
+                "屬性": attr_type or "單",
                 "W": w_val,
                 "D": d_val,
                 "H": h_val,
