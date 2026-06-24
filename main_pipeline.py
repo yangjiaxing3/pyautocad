@@ -18,9 +18,11 @@ from cad_processor import (
     extract_lines_and_texts,
     group_lines_to_polygons,
     identify_pillars,
+    merge_adjacent_spaces,
     bind_texts_to_spaces,
     calculate_net_dimensions,
     assign_sequence_by_route,
+    assign_orientations_by_magenta,
 )
 
 logger = logging.getLogger(__name__)
@@ -120,6 +122,10 @@ def run_pipeline(
     if exclude_list is None:
         exclude_list = []
 
+    # NOTE: 防禦性拆包 — 呼叫者可能傳入 {"entities": [...]} 格式的 dict
+    if isinstance(cad_data, dict) and "entities" in cad_data:
+        cad_data = cad_data["entities"]
+
     logger.info("Pipeline 啟動：%d 個 entities, prefix=%s", len(cad_data), prefix)
 
     if not route_polyline:
@@ -133,8 +139,8 @@ def run_pipeline(
     clean_data = filter_excluded_texts(cad_data, exclude_list)
 
     # 2. 分離線段與文字
-    lines, all_texts = extract_lines_and_texts(clean_data)
-    logger.info("提取出 %d 條線段, %d 個文字標籤", len(lines), len(all_texts))
+    lines, all_texts, arrow_lines = extract_lines_and_texts(clean_data)
+    logger.info("提取出 %d 條線段, %d 個文字標籤, %d 個合併箭頭", len(lines), len(all_texts), len(arrow_lines))
 
     # 3. 文字分類
     boxes, dims, attrs = _categorize_texts(all_texts)
@@ -146,7 +152,30 @@ def run_pipeline(
 
     # 5. 分離柱子與正常空間
     pillars, spaces = identify_pillars(polygons, max_pillar_size=max_pillar_size)
-    logger.info("柱子: %d, 可用空間: %d", len(pillars), len(spaces))
+    logger.info("物理辨識 柱子: %d, 可用空間: %d", len(pillars), len(spaces))
+
+    # 5.5 依據紅色箭頭進行倉位合併
+    spaces = merge_adjacent_spaces(spaces, arrow_lines)
+    logger.info("合併後可用空間: %d", len(spaces))
+
+    # 5.6 利用桃紅色三角形判斷倉位朝向 (orient)
+    spaces = assign_orientations_by_magenta(spaces, cad_data)
+    logger.info("已完成倉位朝向解析 (orient)")
+
+    # 如果物理空間數量遠小於屬性標籤數量，說明線段縫合失敗 (例如網格交叉而非獨立矩形)
+    # 改以「屬性標籤」作為倉位的虛擬空間節點 (Virtual Spaces)
+    if len(spaces) < len(attrs) * 0.5 and len(attrs) > 0:
+        logger.info("物理空間數量異常，啟動虛擬錨點模式 (以屬性標籤為倉位中心)")
+        virtual_spaces = []
+        for a in attrs:
+            x, y = a.get("x", 0), a.get("y", 0)
+            virtual_spaces.append({
+                "min_x": x - 100, "max_x": x + 100,
+                "min_y": y - 100, "max_y": y + 100,
+                "color": a.get("color", 256)
+            })
+        spaces = virtual_spaces
+        logger.info("虛擬空間節點數量: %d", len(spaces))
 
     from cad_processor import SpatialHashGrid
     # 預建空間雜湊網格 (Spatial Hash Grids) 降低 O(N²) 的效能死角
@@ -160,146 +189,146 @@ def run_pipeline(
 
     results = []
 
-    if route_polyline and spaces:
-        # 軌跡動線模式 (Polyline Routing)
-        from cad_processor import assign_sequence_by_route
-        sequenced_spaces = assign_sequence_by_route(spaces, route_polyline, start_num, exclude_list)
+    # 決定每個 Polyline (space) 的命名
+    sequenced_spaces = []
+
+    if (route_polyline or len(boxes) < len(spaces) * 0.1) and spaces:
+        if route_polyline:
+            logger.info("採用 軌跡動線模式 (Polyline Routing)")
+            from cad_processor import assign_sequence_by_route
+            sequenced_spaces = assign_sequence_by_route(spaces, route_polyline, start_num, exclude_list)
+        else:
+            logger.info("採用 自動蛇行路由模式 (Auto-Snake Routing) 因為缺乏足夠的倉位編號標籤")
+            from cad_route_logic import build_visual_aisle_path
+            path_tuples = build_visual_aisle_path(spaces)
+            curr_num = start_num
+            for cx, cy, sp in path_tuples:
+                while str(curr_num).zfill(3) in exclude_list or str(curr_num) in exclude_list:
+                    curr_num += 1
+                sp["unit_id"] = curr_num
+                sequenced_spaces.append(sp)
+                curr_num += 1
+    else:
+        logger.info("採用 Polyline 綁定命名模式 (Polyline Binding)")
+        bindings = bind_texts_to_spaces(boxes, spaces)
+        for i, sp in enumerate(spaces):
+            bound_texts = bindings.get(i, [])
+            if bound_texts:
+                # 找出最靠近 polyline 中心的文字
+                cx = (sp["min_x"] + sp["max_x"]) / 2
+                cy = (sp["min_y"] + sp["max_y"]) / 2
+                best_text = min(bound_texts, key=lambda b: math.hypot(b.get("x", 0) - cx, b.get("y", 0) - cy))
+                txt = best_text.get("text", "")
+                
+                sp["unit_id_str"] = _format_unit_id(txt, prefix)
+                sequenced_spaces.append(sp)
+
+    # 統一處理 sequenced_spaces 撈取 W/D
+    for s in sequenced_spaces:
+        bx = (s["min_x"] + s["max_x"]) / 2
+        by = (s["min_y"] + s["max_y"]) / 2
         
-        for s in sequenced_spaces:
-            bx = (s["min_x"] + s["max_x"]) / 2
-            by = (s["min_y"] + s["max_y"]) / 2
-            
-            # 取出分配好的號碼並補零冠前綴
+        if "unit_id_str" in s:
+            unit_id = s["unit_id_str"]
+            if not unit_id:
+                continue
+        else:
             raw_id = str(s["unit_id"])
             unit_id = f"{prefix}{raw_id.zfill(3)}" if prefix else raw_id.zfill(3)
 
-            # 從空間雜湊網格中尋找鄰近屬性標籤
-            closest_attr = None
-            min_dist = float("inf")
-            candidate_attr_indices = attr_grid.query_radius(bx, by, 800.0)
-            for idx in candidate_attr_indices:
-                a = attrs[idx]
-                dist = math.hypot(a.get("x", 0) - bx, a.get("y", 0) - by)
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_attr = a
+        # 從空間雜湊網格中尋找鄰近屬性標籤
+        closest_attr = None
+        min_dist = float("inf")
+        candidate_attr_indices = attr_grid.query_radius(bx, by, 800.0)
+        for idx in candidate_attr_indices:
+            a = attrs[idx]
+            dist = math.hypot(a.get("x", 0) - bx, a.get("y", 0) - by)
+            if dist < min_dist:
+                min_dist = dist
+                closest_attr = a
 
-            # 找最近的兩個尺寸
-            candidate_dim_indices = dim_grid.query_radius(bx, by, dim_distance_threshold)
-            candidate_dims = [dims[idx] for idx in candidate_dim_indices]
-            sorted_dims = sorted(
-                candidate_dims, key=lambda d: math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by)
-            )
-            nearest_dims = sorted_dims[:2]
+        # 找附近的尺寸標註
+        search_radius = dim_distance_threshold * 2 if s.get("is_merged") else dim_distance_threshold
+        candidate_dim_indices = dim_grid.query_radius(bx, by, search_radius)
+        candidate_dims = [dims[idx] for idx in candidate_dim_indices]
+        candidate_dims = [
+            d for d in candidate_dims
+            if math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by) <= search_radius
+        ]
 
-            # 判定 W 和 D
-            w_val = None
-            d_val = None
-            for d in nearest_dims:
-                if math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by) > dim_distance_threshold:
-                    continue
-                val = round(float(d["text"])) # 取 mm 整數
-                if d.get("color") == 2:  # Yellow → Width
-                    w_val = val
+        # 判定 W 和 D
+        w_val = None
+        d_val = None
+        orient = s.get("orient", "H")
+        is_merged = s.get("is_merged", False)
+
+        if candidate_dims:
+            x_vals = []
+            y_vals = []
+            for d in candidate_dims:
+                val = round(float(d["text"]))
+                dx = d.get("x", bx)
+                dy = d.get("y", by)
+                
+                if abs(dy - by) > abs(dx - bx):
+                    x_vals.append(val)
                 else:
-                    d_val = val
-
-            if w_val is None and len(nearest_dims) >= 1:
-                w_val = round(float(nearest_dims[0]["text"]))
-            if d_val is None and len(nearest_dims) >= 2:
-                d_val = round(float(nearest_dims[1]["text"]))
-
-            # 判定 Type 與 H
-            attr_type = ""
-            h_val = 0.0
-
-            if closest_attr and min_dist < 800: # 提高容錯
-                c = closest_attr.get("color", -1)
-                if c in COLOR_MAPPING:
-                    attr_type, h_val = COLOR_MAPPING[c]
-                else:
-                    attr_type, h_val = "單", 2300
-
-            if not attr_type:
-                c = s.get("color", -1) # 從空間多邊形提取
-                if c in COLOR_MAPPING:
-                    attr_type, h_val = COLOR_MAPPING[c]
-
-            results.append({
-                "倉位號碼": unit_id,
-                "屬性": attr_type or "單",
-                "W": w_val,
-                "D": d_val,
-                "H": h_val,
-            })
-
-    else:
-        # 傳統文字定錨模式 (Text Anchoring)
-        for b in boxes:
-            bx, by = b.get("x", 0), b.get("y", 0)
-    
-            # 找最近的屬性標籤
-            closest_attr = None
-            min_dist = float("inf")
-            candidate_attr_indices = attr_grid.query_radius(bx, by, 800.0)
-            for idx in candidate_attr_indices:
-                a = attrs[idx]
-                dist = math.hypot(a.get("x", 0) - bx, a.get("y", 0) - by)
-                if dist < min_dist:
-                    min_dist = dist
-                    closest_attr = a
-    
-            # 找最近的兩條尺寸標註
-            dims_with_dist = []
-            candidate_dim_indices = dim_grid.query_radius(bx, by, dim_distance_threshold)
-            for idx in candidate_dim_indices:
-                d = dims[idx]
-                dist = math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by)
-                dims_with_dist.append((dist, d))
+                    y_vals.append(val)
             
-            dims_with_dist.sort(key=lambda x: x[0])
-            nearest_dims = [d[1] for d in dims_with_dist[:2]]
-    
-            # 判定 W 和 D
-            w_val = None
-            d_val = None
-            for d in nearest_dims:
-                if math.hypot(d.get("x", 0) - bx, d.get("y", 0) - by) > dim_distance_threshold:
-                    continue
-                val = round(float(d["text"])) # 取 mm 整數
-                if d.get("color") == 2:  # Yellow → Width
-                    w_val = val
+            if orient == "H":
+                w_cands = x_vals
+                d_cands = y_vals
+            else:
+                w_cands = y_vals
+                d_cands = x_vals
+
+            if is_merged:
+                if d_cands:
+                    d_val = sum(d_cands)
                 else:
-                    d_val = val
-    
-            if w_val is None and len(nearest_dims) >= 1:
-                w_val = round(float(nearest_dims[0]["text"]))
-            if d_val is None and len(nearest_dims) >= 2:
-                d_val = round(float(nearest_dims[1]["text"]))
-    
-            # 判定 Type 與 H
-            attr_type = ""
-            h_val = 0.0
-    
-            if closest_attr and min_dist < 500:
-                c = closest_attr.get("color", -1)
-                if c in COLOR_MAPPING:
-                    attr_type, h_val = COLOR_MAPPING[c]
+                    d_val = sum([round(float(d["text"])) for d in candidate_dims])
+                    
+                if w_cands:
+                    w_val = max(set(w_cands), key=w_cands.count)
                 else:
-                    attr_type, h_val = "單", 2300
-    
-            if not attr_type:
-                c = b.get("color", -1)
-                if c in COLOR_MAPPING:
-                    attr_type, h_val = COLOR_MAPPING[c]
-    
-            results.append({
-                "倉位號碼": _format_unit_id(b.get("text", ""), prefix),
-                "屬性": attr_type or "單",
-                "W": w_val,
-                "D": d_val,
-                "H": h_val,
-            })
+                    w_val = d_val
+            else:
+                w_val = w_cands[0] if w_cands else None
+                d_val = d_cands[0] if d_cands else None
+                
+                if w_val is None and d_val is not None:
+                    w_val = d_val
+                elif d_val is None and w_val is not None:
+                    d_val = w_val
+                elif w_val is None and d_val is None:
+                    vals = sorted(set(round(float(d["text"])) for d in candidate_dims))
+                    w_val, d_val = (vals[0], vals[1] if len(vals) > 1 else vals[0])
+
+        # 判定 Type 與 H
+        attr_type = ""
+        h_val = 0.0
+
+        if closest_attr and min_dist < 800:
+            c = closest_attr.get("color", -1)
+            if c in COLOR_MAPPING:
+                attr_type, h_val = COLOR_MAPPING[c]
+            else:
+                attr_type, h_val = "單", 2300
+
+        if not attr_type:
+            c = s.get("color", -1)
+            if c in COLOR_MAPPING:
+                attr_type, h_val = COLOR_MAPPING[c]
+
+        results.append({
+            "倉位號碼": unit_id,
+            "屬性": attr_type or "單",
+            "W": w_val,
+            "D": d_val,
+            "H": h_val,
+            "cx": bx,
+            "cy": by,
+        })
 
     # 7. 排序
     results.sort(key=lambda x: x["倉位號碼"])
@@ -335,13 +364,14 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(levelname)s | %(message)s")
 
     try:
-        data = json.load(open("cad_dump.json", encoding="utf-8"))
+        raw_data = json.load(open("cad_dump.json", encoding="utf-8"))
+        data = raw_data.get("entities", raw_data) if isinstance(raw_data, dict) else raw_data
     except FileNotFoundError:
         logger.error("未找到 cad_dump.json。請先使用提取腳本從 CAD 匯出資料。")
         raise SystemExit(1)
 
     exclude = ["004", "013", "044", "444", "4444"]
-    results = run_pipeline(data, prefix="", exclude_list=exclude)
+    results = run_pipeline(data, prefix="TD", start_num=500, exclude_list=exclude)
 
     if results:
         import os
